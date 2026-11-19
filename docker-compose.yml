@@ -1,62 +1,87 @@
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15-alpine
-    container_name: webhook_db
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password123
-      POSTGRES_DB: webhook_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: sentinel_db
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d webhook_db"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sentinel_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: webhook_redis
+    container_name: sentinel-redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   api:
-    build: .
-    container_name: webhook_api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel-api
+    restart: unless-stopped
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
-      - .:/code
+      - .:/app
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://admin:password123@db:5432/webhook_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@postgres:5432/sentinel_db
       - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - ENVIRONMENT=development
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
 
   worker:
-    build: .
-    container_name: webhook_celery_worker
-    command: celery -A app.worker.celery_app worker --loglevel=info
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentinel-worker
+    restart: unless-stopped
+    command: celery -A backend.app.workers.celery_app worker --loglevel=info -Q default,retries,dlq -c 4 -Ofair
     volumes:
-      - .:/code
+      - .:/app
     environment:
-      - DATABASE_URL=postgresql://admin:password123@db:5432/webhook_db
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@postgres:5432/sentinel_db
       - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - ENVIRONMENT=development
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
       redis:
-        condition: service_started
-      api:
-        condition: service_started
+        condition: service_healthy
+
+  mock-receiver:
+    build:
+      context: ./mock-receiver
+      dockerfile: Dockerfile
+    container_name: sentinel-mock-receiver
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
 
 volumes:
   postgres_data:
